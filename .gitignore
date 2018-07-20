@@ -1,0 +1,5 @@
+build/
+__pycache__/
+scorep_cli_score.egg-info/
+scorep_profile.cpython*
+bind.cpython*

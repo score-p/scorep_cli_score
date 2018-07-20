@@ -1,0 +1,1072 @@
+#!/usr/bin/env python3
+
+import os
+import argparse
+import curses
+import sys
+import threading
+
+import bind
+import scorep_profile
+
+from pathlib import Path
+
+from scorep_tool.model import Region, FilterBy
+from scorep_tool.util import FilterFile, quicksort
+
+
+def options():
+
+    parser = argparse.ArgumentParser(
+        description='A Score-P-score based filter creation tool')
+    parser.add_argument('profile', type=str,
+                        help='cubex profile needed to start')
+    parser.add_argument('-o', '--output', dest='output', action='store',
+                        help='path for new filter file', metavar='file path')
+    parser.add_argument('-f', '--filter', dest='filter', action='store',
+                        help='use existing filter file', metavar='file path')
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-i', '--inclusive-time', dest='inclusive',
+                       action='store_true', help='use and sort by inclusive time [default]')
+    group.add_argument('-e', '--exclusive-time', dest='exclusive',
+                       action='store_true', help='use and sort by exclusive time')
+    group.add_argument('-v', '--visits', dest='visits', action='store_true',
+                       help='sort regions by visits')
+
+    return parser.parse_args()
+
+
+class AsyncRead(threading.Thread):
+
+    def __init__(self, profile):
+        threading.Thread.__init__(self)
+        self._stop_event = threading.Event()
+        self.file = profile
+        self.profile = None
+        self.regions = []
+        self.number_of_regions = 0
+        self.number_of_processes = 0
+
+    def run(self):
+        try:
+            self.profile = scorep_profile.ScoreP_Profile(self.file)
+        except RuntimeError:
+            print('RuntimerError')
+        else:
+            self.number_of_regions = self.profile.getNumberOfRegions()
+            self.number_of_processes = self.profile.getNumberOfProcesses()
+            scoreptypenum = bind.getScorepTypeNum()
+
+            for i in range(scoreptypenum):
+                x = bind.getTypeName(i)
+
+            for region in range(self.number_of_regions):
+                demangled_name = self.profile.getRegionName(region)
+                mangled_name = self.profile.getMangledName(region)
+                group = self.profile.getGroup(region)
+                region_object = Region(
+                    group, self.number_of_processes, demangled_name, mangled_name)
+
+                self.regions.append(region_object)
+
+                for process in range(self.number_of_processes):
+                    visits = self.profile.getVisits(region, process)
+                    time_excl = self.profile.getTime(region, process)
+                    time_incl = self.profile.getInclusiveTime(region, process)
+                    hits = self.profile.getHits(region, process)
+
+                    if not (visits == 0 and hits == 0):
+                        self.regions[region].add(
+                            visits, hits, time_incl, time_excl, process)
+
+    def stop(self):
+        self._stop_event.set()
+
+    def stopped(self):
+        return self._stop_event.is_set()
+
+
+class UserInterface:
+
+    def __init__(self, args):
+        os.environ.setdefault('ESCDELAY', '25')
+        self.stdscr = curses.initscr()
+        self.key = 0
+        self.menu_selected = 0
+        self.previous_selected = -1
+        self.entry_selected = 0
+        self.number_options = 0
+        self.app_name = 'scorep_cli_score'
+
+        self.profile_name = args.profile
+
+        if args.output is None:
+            self.output = ''
+        else:
+            self.output = args.output
+
+        self.regions = []
+
+        self.unsaved = True
+        self.resetted = True
+
+        self.filter_loaded = ''
+        self.profile_loaded = False
+
+        if args.filter is not None:
+            self.filter_loaded = args.filter
+            self.read_filter(self.filter_loaded)
+            self.unsaved = False
+
+        self.width = 0
+        self.height = 0
+
+        self.pad = None
+
+        self.key_left = False
+        self.key_right = False
+
+        self.key_end = False
+        self.key_pos = False
+
+        self.prev_page = False
+        self.next_page = False
+
+        self.pad_y = 0
+        self.pad_x = 0
+
+        self.pad_table_header = None
+
+        self.sort_by = ''
+        self.filter_by = FilterBy()
+
+        self.use_exclusive_time = False
+
+        if args.exclusive:
+            self.use_exclusive_time = True
+            self.sort_by = 'time_excl'
+        elif args.visits:
+            self.sort_by = 'visits'
+        else:
+            self.sort_by = 'time_incl'
+
+        self.regions = quicksort(self.regions, self.sort_by)
+
+        self.use_mangled = False
+
+        self.number_of_regions = 0
+        self.number_of_processes = 0
+
+        self.refresh_entries = False
+
+        self.theader = ['FILTERED', 'TYPE'.ljust(4), 'VISITS'.rjust(14), 'HITS'.rjust(7),
+                        'TIME'.rjust(10), 'REGION']
+
+        curses.noecho()
+        curses.cbreak()
+        self.stdscr.keypad(True)
+
+        curses.curs_set(0)
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_WHITE)
+        curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(4, curses.COLOR_RED, curses.COLOR_WHITE)
+        curses.init_pair(5, curses.COLOR_RED, curses.COLOR_BLACK)
+        curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(8, 6, curses.COLOR_BLACK)
+        curses.init_pair(9, 6, curses.COLOR_WHITE)
+        curses.init_pair(10, curses.COLOR_BLUE, 6)
+
+        self.com_quit = {'shortcut': 'Q', 'description': 'Quit'}
+        self.com_cancel = {'shortcut': 'ESC', 'description': 'Cancel'}
+
+        self.com_filter = {'shortcut': 'F', 'description': 'Filter'}
+        self.com_time_incl = {'shortcut': 'T', 'description': 'InclusiveTime'}
+        self.com_time_excl = {'shortcut': 'T', 'description': 'ExclusiveTime'}
+        self.com_exclude = {'shortcut': 'SPACE',
+                            'description': 'Exclude'}
+        self.com_include = {'shortcut': 'SPACE',
+                            'description': 'Include'}
+        self.com_save = {'shortcut': 'S', 'description': 'Save'}
+        self.com_confirm = {'shortcut': 'ENTER', 'description': 'Confirm'}
+        self.com_reset = {'shortcut': 'R', 'description': 'Reset'}
+        self.com_mangled = {'shortcut': 'M', 'description': 'Mangled'}
+        self.com_demangled = {'shortcut': 'M',
+                              'description': 'Demangled'}
+        self.com_filter = {'shortcut': 'F', 'description': 'Filter'}
+        self.com_load = {'shortcut': 'L', 'description': 'Load'}
+        self.com_sortby = {'shortcut': 'F4', 'description': 'SortBy'}
+        self.com_sortby_time = {'shortcut': 'T', 'description': 'SortByTime'}
+        self.com_sortby_visits = {
+            'shortcut': 'V', 'description': 'SortByVisits'}
+        self.com_save_confirm = {'shortcut': 'ENTER', 'description': 'Save'}
+        self.com_rename = {'shortcut': 'R', 'description': 'Rename'}
+        self.com_load_filter = {'shortcut': 'F', 'description': 'LoadFilter'}
+        self.com_load_profile = {'shortcut': 'P', 'description': 'LoadProfile'}
+        self.com_lt = {'shortcut': '<', 'description': 'LessThan'}
+        self.com_eq = {'shortcut': '=', 'description': 'Equal'}
+        self.com_gt = {'shortcut': '>', 'description': 'GreaterThan'}
+        self.com_filter_time = {'shortcut': 'T', 'description': 'FilterTime'}
+        self.com_filter_visits = {
+            'shortcut': 'V', 'description': 'FilterVisits'}
+
+    def __del__(self):
+        curses.echo()
+        curses.nocbreak()
+        self.stdscr.keypad(False)
+        curses.endwin()
+
+    def load_profile(self):
+        background = AsyncRead(self.profile_name)
+        background.start()
+        background.join()
+        self.number_of_regions = background.number_of_regions
+        self.number_of_processes = background.number_of_processes
+        self.regions = quicksort(background.regions, self.sort_by)
+        self.profile_loaded = True
+
+    def read_filter(self, file_name):
+        f = FilterFile(file_name)
+        f.load()
+        reset = False
+
+        excludes = (i for i in f.load_regions if i.exclude)
+        for region_in in excludes:
+            for region in self.regions:
+                if region.demangled_name == region_in.demangled_name or region.mangled_name == region_in.mangled_name:
+                    region.exclude = True
+                    if not reset:
+                        self.resetted = False
+
+    def reset_regions(self):
+        if self.regions:
+            for region in self.regions:
+                region.exclude = False
+            self.resetted = True
+
+    def filtered_regions(self):
+        if self.regions:
+            return [i for i in self.regions if not i.filtered]
+
+    def render_table_header(self):
+        if self.height > 5:
+            self.stdscr.addnstr(4, 0, 'regions: total ',
+                                self.width - 1, curses.color_pair(8))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(y, x, '{}'.format(
+                len(self.filtered_regions())), self.width - 1, curses.color_pair(6))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(y, x, ' excluded: ',
+                                self.width - 1, curses.color_pair(8))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(y, x, '{}'.format(
+                '-'), self.width - 1, curses.color_pair(6))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(y, x, ' filtered: ',
+                                self.width - 1, curses.color_pair(8))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(y, x, '{}'.format(len(
+                self.regions) - len(self.filtered_regions())), self.width - 1, curses.color_pair(6))
+
+            if self.pad_table_header is None:
+                length = self.max_length_by_name()
+                if length < self.width:
+                    self.pad_table_header = curses.newpad(1, self.width)
+                else:
+                    self.pad_table_header = curses.newpad(1, length)
+
+            y = 0
+            x = 0
+
+            for col in self.theader:
+                if self.sort_by.swapcase().startswith(col.strip()):
+                    self.pad_table_header.addstr(
+                        y, x, '{} '.format(col), curses.color_pair(10))
+                else:
+                    self.pad_table_header.addstr(
+                        y, x, '{} '.format(col), curses.color_pair(7))
+                y, x = self.pad_table_header.getyx()
+
+            height, width = self.pad_table_header.getmaxyx()
+
+            self.pad_table_header.addnstr(y, x, ' '.ljust(
+                width - x - 1), width - x - 1, curses.color_pair(7))
+
+            self.pad_table_header.refresh(0, 0, 5, 0, 5, self.width - 1)
+
+        self.stdscr.refresh()
+
+    def filter_regions(self):
+        if self.regions:
+            if self.filter_by.active:
+                compare_operator, attr, value = self.filter_by.get()
+                for region in self.regions:
+                    if compare_operator(getattr(region, attr), value):
+                        region.filtered = False
+                    else:
+                        region.filtered = True
+                if self.entry_selected > len(self.filtered_regions()) - 1:
+                    self.entry_selected = len(self.filtered_regions()) - 1
+            else:
+                for region in self.regions:
+                    region.filtered = False
+
+    def render_entry(self, line, region=None):
+        if region is None:
+            region = self.filtered_regions()[line]
+
+        color = 2
+        exclude = ' '
+
+        if region.exclude:
+            exclude = '-'
+            color = 5
+        else:
+            exclude = '+'
+
+        if line == self.entry_selected:
+            if region.exclude:
+                color = 4
+            else:
+                color = 1
+
+        self.pad.addstr(line, 0, '[{}]'.format(exclude).center(
+            len(self.theader[0]) + 1), curses.color_pair(color))
+        y, x = self.pad.getyx()
+        self.pad.addstr(y, x, '{}'.format(region.type).ljust(
+            len(self.theader[1]) + 1), curses.color_pair(color))
+        y, x = self.pad.getyx()
+        self.pad.addstr(y, x, '{:,} '.format(region.visits).rjust(
+            len(self.theader[2]) + 1), curses.color_pair(color))
+        y, x = self.pad.getyx()
+        self.pad.addstr(y, x, '{:,} '.format(region.hits).rjust(
+            len(self.theader[3]) + 1), curses.color_pair(color))
+        y, x = self.pad.getyx()
+        if self.use_exclusive_time:
+            self.pad.addstr(y, x, '{0:.2f} '.format(region.time_excl).rjust(
+                len(self.theader[4]) + 1), curses.color_pair(color))
+        else:
+            self.pad.addstr(y, x, '{0:.2f} '.format(region.time_incl).rjust(
+                len(self.theader[4]) + 1), curses.color_pair(color))
+        y, x = self.pad.getyx()
+
+        height, width = self.pad.getmaxyx()
+        avail_space = width - (x + 1)
+
+        if self.use_mangled:
+            self.pad.addstr(y, x, '{}'.format(region.mangled_name).ljust(
+                avail_space), curses.color_pair(color))
+        else:
+            self.pad.addstr(y, x, '{}'.format(region.demangled_name).ljust(
+                avail_space), curses.color_pair(color))
+
+    def max_length_by_name(self):
+        length_theader = 0
+        longest_region_name = ''
+
+        for col in self.theader:
+            if col is not self.theader[-1]:
+                length_theader += len(col) + 1
+        self.stdscr.refresh()
+
+        if self.regions:
+            for i, region in enumerate(self.regions):
+                if len(region.demangled_name) > len(longest_region_name):
+                    longest_region_name = region.demangled_name
+                if len(region.mangled_name) > len(longest_region_name):
+                    longest_region_name = region.mangled_name
+
+        return len(longest_region_name) + length_theader
+
+    def render_entries(self):
+        if self.regions:
+            if self.pad is None:
+                length = self.max_length_by_name()
+                if length < self.width:
+                    self.pad = curses.newpad(
+                        len(self.filtered_regions()), self.width)
+                else:
+                    self.pad = curses.newpad(
+                        len(self.filtered_regions()), length)
+
+            for i, region in enumerate(self.filtered_regions()):
+                self.render_entry(i, region)
+
+    def enter_name(self):
+        commands = [self.com_save_confirm, self.com_cancel]
+
+        self.render_bar(commands)
+
+        length = 0
+        for com in commands:
+            length += len(com['shortcut']) + 1 + len(com['description'])
+
+        self.stdscr.addnstr(self.height - 1, length + 1,
+                            ' ', self.width - 1, curses.color_pair(6))
+        y, x = self.stdscr.getyx()
+        self.stdscr.addnstr(y, x, 'File name: ',
+                            self.width - 1, curses.color_pair(9))
+
+        string = ''
+        delimiter = False
+
+        while self.key != ord('\n') and self.key != 27:
+            key = self.stdscr.getch()
+            symbol = chr(key)
+            y, x = self.stdscr.getyx()
+
+            if (key > 64 and key < 91) or (key > 96 and key < 123) or (key > 47 and key < 58) or ((key == 45) or (key == 95) or (key == 46)) and not delimiter:
+                self.stdscr.addnstr(y, x, '{}'.format(
+                    symbol), self.width - 1, curses.color_pair(9))
+                string = ''.join([string, symbol])
+                if key == 46:
+                    delimiter = True
+            elif key == curses.KEY_BACKSPACE and string:
+                if string.endswith('.'):
+                    delimiter = False
+                string = string[:-1]
+                output = 'File name: {}'.format(string)
+                fill = self.width - length - len(output) - 1
+                self.stdscr.addnstr(self.height - 1, length + 1,
+                                    ' ', self.width - 1, curses.color_pair(6))
+                y, x = self.stdscr.getyx()
+                self.stdscr.addnstr(y, x, '{}'.format(output.ljust(
+                    fill)), self.width - 1, curses.color_pair(9))
+
+                self.stdscr.move(self.height - 1, length + 2 + len(output))
+
+            self.key = key
+        if self.key == 27:
+            return ''
+        else:
+            return string
+
+    def enter_value(self, description):
+        commands = [self.com_save_confirm, self.com_cancel]
+
+        self.render_bar(commands)
+
+        length = 0
+        for com in commands:
+            length += len(com['shortcut']) + 1 + len(com['description'])
+
+        self.stdscr.addnstr(self.height - 1, length + 1,
+                            ' ', self.width - 1, curses.color_pair(6))
+        y, x = self.stdscr.getyx()
+        self.stdscr.addnstr(y, x, '{} : '.format(
+            description), self.width - 1, curses.color_pair(9))
+
+        string = ''
+        delimiter = False
+
+        while self.key != ord('\n') and self.key != 27:
+            key = self.stdscr.getch()
+            symbol = chr(key)
+            y, x = self.stdscr.getyx()
+
+            if (key > 47 and key < 58) or (key == 46) and not delimiter:
+                self.stdscr.addnstr(y, x, '{}'.format(
+                    symbol), self.width - 1, curses.color_pair(9))
+                string = ''.join([string, symbol])
+                if key == 46:
+                    delimiter = True
+            elif key == curses.KEY_BACKSPACE and string:
+                if string.endswith('.'):
+                    delimiter = False
+                string = string[:-1]
+                output = '{} : {}'.format(description, string)
+                fill = self.width - length - len(output) - 1
+                self.stdscr.addnstr(self.height - 1, length + 1,
+                                    ' ', self.width - 1, curses.color_pair(6))
+                y, x = self.stdscr.getyx()
+                self.stdscr.addnstr(y, x, '{}'.format(output.ljust(
+                    fill)), self.width - 1, curses.color_pair(9))
+
+                self.stdscr.move(self.height - 1, length + 2 + len(output))
+
+            self.key = key
+        if self.key == 27:
+            return ''
+        else:
+            return float(string)
+
+    def refresh_pad(self):
+        length = self.max_length_by_name()
+        offset = 6
+
+        if self.height >= 8:
+            height = (self.height - 1 - offset)
+            if self.key_end:
+                self.entry_selected = len(self.filtered_regions()) - 1
+                self.pad_y = self.entry_selected + 1 - height
+                self.stdscr.addnstr(0, 0, 'i={}, pad_y={}'.format(
+                    self.entry_selected, self.pad_y), self.width - 1, curses.color_pair(1))
+                self.render_entry(self.previous_selected)
+                self.render_entry(self.entry_selected)
+                self.key_end = False
+            elif self.key_pos:
+                self.entry_selected = 0
+                self.pad_y = 0
+                self.render_entry(self.previous_selected)
+                self.render_entry(self.entry_selected)
+                self.key_pos = False
+            elif self.prev_page:
+                if self.entry_selected > height:
+                    self.entry_selected -= height
+                    self.render_entry(self.previous_selected)
+                    self.render_entry(self.entry_selected)
+                    self.pad_y = height * (self.entry_selected // height)
+                self.prev_page = False
+
+            elif self.next_page:
+                if self.entry_selected + height < (len(self.filtered_regions()) - 1):
+                    self.entry_selected += height
+                    self.render_entry(self.previous_selected)
+                    self.render_entry(self.entry_selected)
+                    self.pad_y = height * (self.entry_selected // height)
+                self.next_page = False
+
+            elif self.entry_selected == self.pad_y + height:
+                self.pad_y += 1
+
+            elif self.entry_selected < self.pad_y:
+                self.pad_y -= 1
+
+            elif self.key_right and (self.width < length) and ((length - self.pad_x) > self.width):
+                if (length - self.width) <= self.width:
+                    self.pad_x += length - self.width
+                else:
+                    self.pad_x += self.width
+            elif self.key_left and (self.width < length) and self.pad_x > 0:
+                if (length - self.width) <= self.width:
+                    self.pad_x -= length - self.width
+                else:
+                    self.pad_x -= self.width
+
+            self.pad.refresh(self.pad_y, self.pad_x, offset,
+                             0, self.height - 2, self.width - 1)
+            self.pad_table_header.refresh(
+                0, self.pad_x, 5, 0, 5, self.width - 1)
+            self.key_left = False
+            self.key_right = False
+
+    def show_output(self):
+        if not self.output:
+            o = '-'
+        else:
+            o = self.output
+
+        if not self.profile_name:
+            p = '-'
+        else:
+            p = self.profile_name
+
+        if not self.filter_loaded:
+            f = '-'
+        else:
+            f = self.filter_loaded
+
+        if self.height > 1:
+            self.stdscr.addnstr(1, 0, 'profile: ',
+                                self.width - 1, curses.color_pair(8))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(1, x, p, self.width - 1, curses.color_pair(6))
+
+        if self.height > 2:
+            self.stdscr.addnstr(
+                2, 0, 'output: ', self.width - 1, curses.color_pair(8))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(2, x, o, self.width - 1, curses.color_pair(6))
+
+        if self.height > 3:
+            self.stdscr.addnstr(
+                3, 0, 'filter: ', self.width - 1, curses.color_pair(8))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(3, x, f, self.width - 1, curses.color_pair(6))
+
+    def adjust_time(self):
+        self.refresh_entries = True
+        commands = [self.com_confirm, self.com_cancel]
+        self.render_bar(commands)
+        length = 0
+        for com in commands:
+            length += len(com['shortcut']) + 1 + \
+                len(com['description'])
+        key_prev = self.key
+        self.key = 0
+        if self.use_exclusive_time:
+            output = 'Also sort by inclusive time?'
+        else:
+            output = 'Also sort by exclusive time?'
+        self.stdscr.addnstr(
+            self.height - 1, length + 1, ' ', self.width - 1, curses.color_pair(6))
+        y, x = self.stdscr.getyx()
+        self.stdscr.addnstr(y, x, output, self.width - 1, curses.color_pair(9))
+
+        while self.key != ord('\n') and self.key != 27:
+            self.key = self.stdscr.getch()
+
+        if self.key == ord('\n'):
+            if self.use_exclusive_time:
+                self.sort_by = 'time_incl'
+            else:
+                self.sort_by = 'time_excl'
+            self.regions = quicksort(self.regions, self.sort_by)
+
+        if self.use_exclusive_time:
+            self.use_exclusive_time = False
+            if self.filter_by.active and self.filter_by.attr == 'time_excl':
+                key_prev = self.key
+                self.key = 0
+                self.stdscr.addnstr(self.height - 1, length + 1,
+                                    ' ', self.width - 1, curses.color_pair(6))
+                y, x = self.stdscr.getyx()
+                self.stdscr.addnstr(y, x, 'Update current filter to inlcusive time?',
+                                    self.width - 1, curses.color_pair(9))
+                while self.key != ord('\n') and self.key != 27:
+                    self.key = self.stdscr.getch()
+                if self.key == ord('\n'):
+                    self.filter_by.attr = 'time_incl'
+                    self.filter_regions()
+        else:
+            self.use_exclusive_time = True
+            if self.filter_by.active and self.filter_by.attr == 'time_incl':
+                key_prev = self.key
+                self.key = 0
+                self.stdscr.addnstr(self.height - 1, length + 1,
+                                    ' ', self.width - 1, curses.color_pair(6))
+                y, x = self.stdscr.getyx()
+                self.stdscr.addnstr(y, x, 'Update current filter to exclusive time?',
+                                    self.width - 1, curses.color_pair(9))
+                while self.key != ord('\n') and self.key != 27:
+                    self.key = self.stdscr.getch()
+                if self.key == ord('\n'):
+                    self.filter_by.attr = 'time_excl'
+                    self.filter_regions()
+        self.key = key_prev
+
+    def adjust_name(self):
+        if self.use_mangled:
+            self.use_mangled = False
+            self.refresh_entries = True
+        else:
+            self.use_mangled = True
+            self.refresh_entries = True
+
+    def sort(self):
+        commands = [self.com_cancel,
+                    self.com_sortby_time, self.com_sortby_visits]
+
+        self.render_bar(commands)
+
+        length = 0
+        for com in commands:
+            length += len(com['shortcut']) + 1 + \
+                len(com['description'])
+
+        # self.stdscr.refresh()
+
+        while self.key != 27 and self.key != ord('t') and self.key != ord('T') and self.key != ord('v') and self.key != ord('V'):
+            self.key = self.stdscr.getch()
+
+        if self.key == ord('t') or self.key == ord('T'):
+            if self.use_exclusive_time:
+                self.sort_by = ('time_excl')
+            else:
+                self.sort_by = 'time_incl'
+            self.regions = quicksort(self.regions, self.sort_by)
+            self.refresh_entries = True
+        elif self.key == ord('v') or self.key == ord('V'):
+            self.sort_by = 'visits'
+            self.regions = quicksort(self.regions, self.sort_by)
+            self.refresh_entries = True
+
+    def filter(self):
+        key_prev = self.key
+
+        commands = [self.com_cancel, self.com_filter_time,
+                    self.com_filter_visits]
+
+        if self.filter_by.active:
+            commands.append(self.com_reset)
+        self.stdscr.refresh()
+
+        self.render_bar(commands)
+
+        if self.filter_by.active:
+            while self.key != 27 and self.key != ord('t') and self.key != ord('T') and self.key != ord('v') and self.key != ord('V') and self.key != ord('r') and self.key != ord('R'):
+                self.key = self.stdscr.getch()
+        else:
+            while self.key != 27 and self.key != ord('t') and self.key != ord('T') and self.key != ord('v') and self.key != ord('V'):
+                self.key = self.stdscr.getch()
+
+        if self.filter_by.active and self.key == ord('r') or self.key == ord('R'):
+            self.filter_by.reset()
+            self.filter_regions()
+            self.pad.erase()
+            self.refresh_entries = True
+        elif self.key != 27:
+            commands = [self.com_cancel, self.com_lt,
+                        self.com_eq, self.com_gt]
+            self.render_bar(commands)
+
+            length = 0
+            for com in commands:
+                length += len(com['shortcut']) + 1 + \
+                    len(com['description'])
+            if self.key == ord('t') or self.key == ord('T'):
+                if self.use_exclusive_time:
+                    attr = 'time_excl'
+                    output = 'ExclusiveTime'
+                else:
+                    attr = 'time_incl'
+                    output = 'InclusiveTime'
+                self.stdscr.addnstr(
+                    self.height - 1, length + 1, ' ', self.width - 1, curses.color_pair(6))
+                y, x = self.stdscr.getyx()
+                self.stdscr.addnstr(y, x, '[{}]'.format(
+                    output), self.width - 1, curses.color_pair(3))
+            if self.key == ord('v') or self.key == ord('V'):
+                attr = 'visits'
+                self.stdscr.addnstr(
+                    self.height - 1, length + 1, ' ', self.width - 1, curses.color_pair(6))
+                y, x = self.stdscr.getyx()
+                self.stdscr.addnstr(
+                    y, x, '[visits]', self.width - 1, curses.color_pair(3))
+
+            if self.key == ord('t') or self.key == ord('T') or self.key == ord('v') or self.key == ord('V'):
+                self.stdscr.clrtoeol()
+
+                while self.key != 27 and self.key != ord('=') and self.key != ord('<') and self.key != ord('>'):
+                    self.key = self.stdscr.getch()
+
+                if self.key != 27:
+                    if self.key == ord('<'):
+                        compare_operator = '<'
+                    if self.key == ord('='):
+                        compare_operator = '='
+                    if self.key == ord('>'):
+                        compare_operator = '>'
+
+                    commands = [self.com_cancel, self.com_confirm]
+                    self.render_bar(commands)
+
+                    if attr == 'time_excl' or attr == 'time_incl':
+                        value = self.enter_value(
+                            'time {}'.format(compare_operator))
+                    elif attr == 'visits':
+                        value = self.enter_value(
+                            'visits {}'.format(compare_operator))
+
+                    length = 0
+                    for com in commands:
+                        length += len(com['shortcut']) + \
+                            1 + len(com['description'])
+
+                    while self.key != 27 and self.key != ord('\n'):
+                        self.key = self.stdscr.getch()
+
+                    if self.key == ord('\n'):
+                        self.filter_by.set(
+                            compare_operator, attr, value)
+                        self.filter_regions()
+                        self.pad.erase()
+                        self.refresh_entries = True
+                        self.unsaved = True
+
+        self.key = key_prev
+
+    def load(self):
+        key_prev = self.key
+
+        commands = [self.com_confirm, self.com_cancel,
+                    self.com_load_filter, self.com_load_profile]
+        self.render_bar(commands)
+
+        self.key = 0
+        while self.key != ord('n') and self.key != 27 and self.key != ord('f') and self.key != ord('F') and self.key != ord('p') and self.key != ord('P'):
+            self.key = self.stdscr.getch()
+
+            if self.key == ord('f') or self.key == ord('F'):
+                while self.key != 27:
+                    new_filter_name = self.enter_name()
+                    if self.key != 27:
+                        p = Path(new_filter_name)
+                        if p.is_file():
+                            self.output = new_filter_name
+                            for r in self.regions:
+                                r.exclude = False
+                            self.read_filter(self.output)
+                            self.show_output()
+                            self.unsaved = False
+                            self.render_entries()
+                            self.refresh_pad()
+                            self.refresh_entries = True
+                            self.key = 27
+                        else:
+                            commands = [
+                                self.com_confirm, self.com_cancel]
+                            self.render_bar(commands)
+                            length = 0
+                            for com in commands:
+                                length += len(com['shortcut']) + \
+                                    1 + len(com['description'])
+                            self.stdscr.addnstr(self.height - 1, length + 1,
+                                                '\'{}\' doesn\'t exist. Try again?'.format(new_filter_name), self.width - 1, curses.color_pair(4))
+                            self.key = 0
+                            while self.key != ord('\n') and self.key != 27:
+                                self.key = self.stdscr.getch()
+                            if self.key == ord('\n'):
+                                self.key = 0
+
+            elif self.key == ord('p') or self.key == ord('P'):
+                while self.key != 27:
+                    new_profile_name = self.enter_name()
+                    if self.key != 27:
+                        p = Path(new_profile_name)
+                        if p.is_file():
+                            self.profile_name = new_profile_name
+                            self.stdscr.addnstr(self.height - 1, 0,
+                                                'Loading \'{}\''.format(self.profile_name), self.width - 1, curses.color_pair(1))
+                            self.stdscr.refresh()
+                            self.load_profile()
+                            self.show_output()
+                            self.resetted = True
+                            self.refresh_entries = True
+                            self.key = 27
+                        else:
+                            commands = [
+                                self.com_confirm, self.com_cancel]
+                            self.render_bar(commands)
+                            length = 0
+                            for com in commands:
+                                length += len(com['shortcut']) + \
+                                    1 + len(com['description'])
+                            self.stdscr.addnstr(self.height - 1, length + 1,
+                                                '\'{}\' doesn\'t exist. Try again?'.format(new_profile_name), self.width - 1, curses.color_pair(4))
+                            self.key = 0
+                            while self.key != ord('\n') and self.key != 27:
+                                self.key = self.stdscr.getch()
+                            if self.key == ord('\n'):
+                                self.key = 0
+        self.key = key_prev
+
+    def save(self):
+        commands = [self.com_save_confirm,
+                    self.com_rename, self.com_cancel]
+        self.render_bar(commands)
+        save = False
+        length = 0
+        key_prev = self.key
+        if self.output:
+            for com in commands:
+                length += len(com['shortcut']) + 1 + \
+                    len(com['description'])
+            self.stdscr.addnstr(self.height - 1, length + 1, ' ', self.width - 1, curses.color_pair(6))
+            y, x = self.stdscr.getyx()
+            self.stdscr.addnstr(y, x, 'Save as \'{}\'?'.format(self.output), self.width - 1, curses.color_pair(9))
+            while self.key != ord('\n') and self.key != ord('r') and self.key != 27:
+                self.key = self.stdscr.getch()
+
+            if self.key == ord('\n'):
+                save = True
+            elif self.key == ord('r'):
+                self.output = self.enter_name()
+            elif self.key == 27:
+                save = False
+        else:
+            self.output = self.enter_name()
+            if self.key != 27:
+                save = True
+
+        self.key = key_prev
+
+        if save:
+            f = FilterFile(self.output)
+            f.regions = self.regions
+            f.save()
+            self.unsaved = False
+
+    def reset(self):
+        key_prev = self.key
+        commands = [self.com_confirm, self.com_cancel]
+        self.render_bar(commands)
+        length = 0
+        for com in commands:
+            length += len(com['shortcut']) + 1 + \
+                len(com['description'])
+        self.stdscr.addnstr(self.height - 1, length + 1,
+                            ' ', self.width - 1, curses.color_pair(6))
+        y, x = self.stdscr.getyx()
+        self.stdscr.addnstr(y, x, 'Reset? '.format(self.output), self.width - 1, curses.color_pair(9))
+        while self.key != ord('\n') and self.key != 27:
+            self.key = self.stdscr.getch()
+
+        if self.key == ord('\n'):
+            self.reset_regions()
+            self.refresh_entries = True
+            self.unsaved = True
+
+        self.key = key_prev
+
+    def key_detection(self):
+
+        if self.key != ord('q') and self.key != ord('Q'):
+
+            if self.key == curses.KEY_RESIZE:
+                self.height, self.width = self.stdscr.getmaxyx()
+                self.pad_x = 0
+
+            elif self.key == ord(' '):
+                self.regions[self.entry_selected].exclude = not self.regions[
+                    self.entry_selected].exclude
+                self.unsaved = True
+                self.resetted = False
+
+            elif self.key == curses.KEY_LEFT:
+                self.key_left = True
+
+            elif self.key == curses.KEY_RIGHT:
+                self.key_right = True
+
+            elif self.key == ord('t') or self.key == ord('T'):
+                self.adjust_time()
+
+            elif self.key == ord('m') or self.key == ord('M'):
+                self.adjust_name()
+
+            elif self.key == curses.KEY_F4:
+                self.sort()
+
+            elif self.key == ord('f') or self.key == ord('F'):
+                self.filter()
+
+            elif self.key == ord('l') or self.key == ord('L'):
+                self.load()
+
+            elif (self.key == ord('s') or self.key == ord('S')) and self.unsaved:
+                self.save()
+
+            elif (self.key == ord('r') or self.key == ord('R')) and not self.resetted:
+                self.reset()
+
+            elif self.key == curses.KEY_PPAGE:
+                self.prev_page = True
+
+            elif self.key == curses.KEY_NPAGE:
+                self.next_page = True
+
+            elif self.key == curses.KEY_END:
+                self.key_end = True
+
+            elif self.key == curses.KEY_HOME:
+                self.key_pos = True
+
+            self.previous_selected = self.entry_selected
+
+            if self.key == curses.KEY_DOWN:
+                if self.entry_selected < (len(self.filtered_regions()) - 1):
+                    self.entry_selected += 1
+            if self.key == curses.KEY_UP:
+                if self.entry_selected > 0:
+                    self.entry_selected -= 1
+
+            self.render_table_header()
+
+            if self.refresh_entries or self.pad is None:
+                self.render_entries()
+                self.refresh_entries = False
+            else:
+                self.render_entry(self.previous_selected)
+                self.render_entry(self.entry_selected)
+
+            self.refresh_pad()
+
+            self.show_output()
+
+            commands = [self.com_filter, self.com_load, self.com_sortby]
+            if self.use_exclusive_time:
+                commands.append(self.com_time_incl)
+            else:
+                commands.append(self.com_time_excl)
+
+            if self.use_mangled:
+                commands.append(self.com_demangled)
+            else:
+                commands.append(self.com_mangled)
+
+            if self.filtered_regions()[self.entry_selected].exclude:
+                commands.append(self.com_include)
+            else:
+                commands.append(self.com_exclude)
+
+            if not self.resetted:
+                commands.append(self.com_reset)
+
+            if self.unsaved:
+                commands.append(self.com_save)
+
+            commands.append(self.com_quit)
+
+            self.render_bar(commands)
+
+            self.key = self.stdscr.getch()
+
+    def render_title(self):
+        if len(self.app_name) > self.width and self.height > 0:
+            pos = 0
+        elif self.height > 0:
+            pos = int((self.width // 2) - (len(self.app_name) // 2))
+        self.stdscr.addnstr(0, 0, self.app_name.rjust(
+            pos + len(self.app_name)), self.width - 1, curses.A_BOLD)
+        self.stdscr.clrtoeol()
+
+    def render_bar(self, commands):
+        if self.height - 1 > 3:
+            y = self.height - 1
+            x = 0
+
+            for command in commands:
+                output = command['shortcut'].rjust(
+                    len(command['shortcut']) + 1)
+
+                self.stdscr.addnstr(
+                    y, x, output, self.width - 1 - x, curses.color_pair(6))
+                self.stdscr.refresh()
+                y, x = curses.getsyx()
+
+                output = command['description']
+
+                self.stdscr.addnstr(
+                    y, x, output, self.width - 1 - x, curses.color_pair(3))
+                self.stdscr.refresh()
+                y, x = curses.getsyx()
+
+            self.stdscr.addnstr(self.height - 1, x, ' '.ljust(self.width - 1 - x),
+                                self.width - 1 - x, curses.color_pair(3))
+
+    def render(self):
+
+        while self.key != ord('q') and self.key != ord('Q'):
+            self.height, self.width = self.stdscr.getmaxyx()
+
+            self.render_title()
+
+            if not self.profile_loaded:
+                self.stdscr.addnstr(1, 0, 'Loading profile...', self.width - 1, curses.color_pair(6))
+                self.stdscr.refresh()
+                self.load_profile()
+
+            self.key_detection()
+
+
+def main():
+    args = options()
+    ui = UserInterface(args)
+    ui.render()
+
+if __name__ == '__main__':
+    main()
