@@ -7,7 +7,7 @@ scorep_cli_score is a user interface for scorep-score based on ncurses. It lets 
 ### Requirements
 
 -   Python3
--   libscorep-score [2]
+-   libscorep-score povided by Score-P 4.0 [2]
 
 ### Build
 
@@ -51,4 +51,4 @@ Open your terminal, navigate to the repository and install scorep-score-gui:
 
 [1] https://github.com/score-p/scorep_cli_score
 
-[2] https://silc.zih.tu-dresden.de/svn/silc-root/branches/TRY_PSAVIANKOU_ScorePScoreAsLibrary
+[2] http://score-p.org/
