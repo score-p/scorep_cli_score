@@ -11,8 +11,8 @@ import scorep_profile
 
 from pathlib import Path
 
-from scorep_tool.model import Region, FilterBy
-from scorep_tool.util import FilterFile, quicksort
+from scorep_cli_score.model import Region, FilterBy
+from scorep_cli_score.util import FilterFile, quicksort
 
 
 def options():
@@ -97,7 +97,7 @@ class UserInterface:
         self.previous_selected = -1
         self.entry_selected = 0
         self.number_options = 0
-        self.app_name = 'scorep_cli_score'
+        self.app_name = 'scorep-cli-score'
 
         self.profile_name = args.profile
 

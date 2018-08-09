@@ -1,4 +1,4 @@
-from scorep_tool.model import RegionLoad
+from scorep_cli_score.model import RegionLoad
 
 
 class FilterFile:

@@ -1,6 +1,6 @@
-# scorep_cli_score
+# scorep-cli-score
 
-scorep_cli_score is a user interface for scorep-score based on ncurses. It lets you create filter files by sorting and filtering regions. [1]
+scorep-cli-score is a user interface for scorep-score based on ncurses. It lets you create filter files by sorting and filtering regions. [1]
 
 ## Installation
 
@@ -13,7 +13,7 @@ scorep_cli_score is a user interface for scorep-score based on ncurses. It lets 
 
 Open your terminal, navigate to the repository and install scorep-score-gui:
 
-	cd scorepscore-gui
+	cd scorep_cli_score
 	pip install .
 
 ## Usage
