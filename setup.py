@@ -1,3 +1,4 @@
+import re
 import setuptools
 import subprocess
 import sys
@@ -5,8 +6,21 @@ import sys
 if sys.version_info < (3, 5):
     sys.exit('Python 3.4 or older is not supported.')
 
-scorep_include_dir = subprocess.check_output(["scorep-config", "--cppflags"]).decode('utf-8').split()[0][2:]
-scorep_library_dir = subprocess.check_output(["scorep-config", "--ldflags"]).decode('utf-8').split()[0][2:]
+
+def remove_flag3(x):
+    return x[3:]
+
+ldflags = subprocess.check_output(["scorep-config", "--ldflags"]).decode('utf-8')
+cflags = subprocess.check_output(["scorep-config", "--cflags"]).decode('utf-8')
+
+ldflags = " " + ldflags
+cflags = " " + cflags
+
+scorep_include_dir = re.findall(" -I[/+-@.\w]*", cflags)
+scorep_library_dir = re.findall(" -L[/+-@.\w]*", ldflags)
+
+scorep_include_dir = list(map(remove_flag3, scorep_include_dir))[0]
+scorep_library_dir = list(map(remove_flag3, scorep_library_dir))[0]
 
 setuptools.setup(name='scorep-cli-score',
                  version='0.1',
